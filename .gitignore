@@ -1,0 +1,6 @@
+/build*/
+/results/
+/docs/
+/.vs/
+*.user
+*.ply
