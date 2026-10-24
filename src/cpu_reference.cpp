@@ -1,4 +1,5 @@
 #include "fluid/cpu_reference.h"
+#include "fluid/boundary_math.cuh"
 #include "fluid/initialization.h"
 #include <algorithm>
 #include <cmath>
@@ -13,16 +14,6 @@ SimParams validated_params(SimParams params) {
     return params;
 }
 
-void collide_axis(float& position, float& velocity, float low, float high, float restitution) {
-    if (position <= low) {
-        position = low;
-        if (velocity < 0.0f) velocity = -velocity * restitution;
-    } else if (position >= high) {
-        position = high;
-        if (velocity > 0.0f) velocity = -velocity * restitution;
-    }
-}
-
 void validate_state(const ParticleState& state, const SimParams& params) {
     if (state.positions.empty() || state.positions.size() > max_cpu_particles ||
         state.positions.size() != state.velocities.size())
@@ -35,11 +26,7 @@ void validate_state(const ParticleState& state, const SimParams& params) {
 } // namespace
 
 void collide_with_box(Vec3& position, Vec3& velocity, const SimParams& params) {
-    const auto low = params.lower_bound();
-    const auto high = params.upper_bound();
-    collide_axis(position.x, velocity.x, low.x, high.x, params.restitution);
-    collide_axis(position.y, velocity.y, low.y, high.y, params.restitution);
-    collide_axis(position.z, velocity.z, low.z, high.z, params.restitution);
+    collide_bounds(position, velocity, params.lower_bound(), params.upper_bound(), params.restitution);
 }
 
 CpuSphSolver::CpuSphSolver(SimParams params, ParticleState state)

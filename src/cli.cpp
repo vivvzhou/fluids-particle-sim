@@ -49,7 +49,8 @@ CliOptions parse_cli(int argc, char** argv) {
         if (flag == "--scene") {
             if (value != "dam-break") throw std::invalid_argument("only --scene dam-break is implemented");
         } else if (flag == "--backend") {
-            if (value != "cpu") throw std::invalid_argument("only --backend cpu is implemented (M1)");
+            if (value != "cpu" && value != "cuda") throw std::invalid_argument("backend must be cpu or cuda");
+            options.backend = value;
         } else if (flag == "--particles") options.particles = integer(value, flag);
         else if (flag == "--steps") options.steps = integer(value, flag);
         else if (flag == "--seed") options.seed = integer(value, flag);
@@ -72,19 +73,19 @@ CliOptions parse_cli(int argc, char** argv) {
     if (!seen.count("--padding")) options.params.boundary_padding = 0.5f * options.params.spacing;
     options.params.validate();
     if (options.particles == 0 || options.particles > max_cpu_particles)
-        throw std::invalid_argument("CPU particle count must be in [1, 4096]; recommend 128-512");
+        throw std::invalid_argument("all-pairs particle count must be in [1, 4096]; correctness cases use 128-512");
     if (options.jitter < 0.0f || options.jitter > 0.1f)
         throw std::invalid_argument("jitter must be in [0, 0.1]");
     return options;
 }
 
 void print_help(std::ostream& output) {
-    output << "fluid_sim: 3D WCSPH CPU reference (M0/M1 only)\n"
+    output << "fluid_sim: 3D WCSPH CPU and naive CUDA references (through M2)\n"
               "Usage: fluid_sim [options]\n"
               "  --help                 Show help (use alone)\n"
               "  --device-info          CUDA runtime/device query (use alone; unavailable = exit 2)\n"
               "  --scene dam-break      Deterministic tall fluid block\n"
-              "  --backend cpu          Only implemented solver\n"
+              "  --backend cpu|cuda     Default cpu; cuda requires a CUDA-enabled build and GPU\n"
               "  --particles N          Default 256; allowed 1-4096, recommend 128-512; O(N^2)\n"
               "  --steps N              Default 1000; 0 exports/evaluates initial state only\n"
               "  --dt FLOAT             Fixed timestep, default 0.0005\n"
@@ -106,7 +107,7 @@ void print_help(std::ostream& output) {
 void print_settings(std::ostream& output, const CliOptions& options) {
     const auto& p = options.params;
     output << std::setprecision(std::numeric_limits<float>::max_digits10)
-           << "backend=cpu scene=dam-break particles=" << options.particles << " steps=" << options.steps
+           << "backend=" << options.backend << " scene=dam-break particles=" << options.particles << " steps=" << options.steps
            << " dt=" << p.dt << " seed=" << options.seed << " jitter=" << options.jitter
            << "\nspacing=" << p.spacing << " h=" << p.smoothing_radius << " mass=" << p.particle_mass()
            << " rho0=" << p.rest_density << " stiffness=" << p.stiffness << " viscosity_nu=" << p.viscosity

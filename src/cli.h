@@ -5,10 +5,12 @@
 #include <cstdint>
 #include <filesystem>
 #include <iosfwd>
+#include <string>
 
 namespace fluid {
 struct CliOptions {
     SimParams params;
+    std::string backend = "cpu";
     std::size_t particles = 256;
     std::size_t steps = 1000;
     std::uint32_t seed = 42;
