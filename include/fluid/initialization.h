@@ -8,6 +8,7 @@
 namespace fluid {
 // Small CPU reference guard, not a GPU-scale preset. Recommend 128-512 particles.
 inline constexpr std::size_t max_cpu_particles = 4096;
+inline constexpr std::size_t max_grid_particles = 50000; // M3 acceptance ceiling; M4 adds 100K.
 
 // A tall block toward the lower-x wall, centered in z. Jitter is a fraction of spacing.
 // Uses explicitly mapped mt19937 integer output for deterministic seeded positions.

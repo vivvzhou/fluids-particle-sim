@@ -76,7 +76,8 @@ int main(int argc, char** argv) {
         }
 #if FLUID_HAS_CUDA
         else {
-            fluid::CudaSphSolver solver(options.params, initial);
+            const auto search = options.neighbor_search == "grid" ? fluid::CudaNeighborSearch::uniform_grid : fluid::CudaNeighborSearch::all_pairs;
+            fluid::CudaSphSolver solver(options.params, initial, search);
             run_simulation(solver, options);
         }
 #endif

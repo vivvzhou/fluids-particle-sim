@@ -5,9 +5,11 @@
 #include "test_support.h"
 #include <array>
 #include <limits>
+#include <memory>
 #include <string>
 
 namespace {
+fluid::CudaNeighborSearch search = fluid::CudaNeighborSearch::all_pairs;
 struct ErrorStats {
     const char* name;
     double absolute_tolerance;
@@ -29,19 +31,20 @@ struct ErrorStats {
 struct Comparison {
     std::array<ErrorStats, 5> errors{{{"position", 1.0e-5}, {"velocity", 1.0e-4},
                                    {"density", 1.0e-2}, {"pressure", 1.0}, {"acceleration", 1.0e-2}}};
-    void compare(fluid::CudaSphSolver& gpu, const fluid::CpuSphSolver& cpu) {
+    void compare(fluid::CudaSphSolver& gpu, const fluid::ParticleState& expected, const fluid::SphFields& expected_fields) {
         auto state = gpu.download_state();
         auto fields = gpu.download_fields();
-        CHECK(state.positions.size() == cpu.particle_count());
-        for (std::size_t i = 0; i < cpu.particle_count(); ++i) {
-            errors[0].compare(state.positions[i], cpu.state().positions[i], i);
-            errors[1].compare(state.velocities[i], cpu.state().velocities[i], i);
-            errors[2].compare(fields.densities[i], cpu.fields().densities[i], i);
-            errors[3].compare(fields.pressures[i], cpu.fields().pressures[i], i);
-            errors[4].compare(fields.accelerations[i], cpu.fields().accelerations[i], i);
-            CHECK(fluid::inside_bounds(state.positions[i], cpu.params()));
+        CHECK(state.positions.size() == expected.positions.size());
+        for (std::size_t i = 0; i < expected.positions.size(); ++i) {
+            errors[0].compare(state.positions[i], expected.positions[i], i);
+            errors[1].compare(state.velocities[i], expected.velocities[i], i);
+            errors[2].compare(fields.densities[i], expected_fields.densities[i], i);
+            errors[3].compare(fields.pressures[i], expected_fields.pressures[i], i);
+            errors[4].compare(fields.accelerations[i], expected_fields.accelerations[i], i);
+            CHECK(fluid::inside_bounds(state.positions[i], gpu.params()));
         }
     }
+    void compare(fluid::CudaSphSolver& gpu, const fluid::CpuSphSolver& cpu) { compare(gpu, cpu.state(), cpu.fields()); }
     void report() const {
         for (const auto& e : errors)
             std::cout << e.name << " max_abs_error=" << e.maximum_error << " max_tolerance_fraction=" << e.maximum_budget_fraction << '\n';
@@ -50,13 +53,20 @@ struct Comparison {
 
 void compare_steps(const fluid::SimParams& p, const fluid::ParticleState& initial, Comparison& comparison) {
     fluid::CpuSphSolver cpu(p, initial);
-    fluid::CudaSphSolver gpu(p, initial);
+    fluid::CudaSphSolver gpu(p, initial, search);
+    std::unique_ptr<fluid::CudaSphSolver> naive;
+    if (search == fluid::CudaNeighborSearch::uniform_grid) naive = std::make_unique<fluid::CudaSphSolver>(p, initial);
     comparison.compare(gpu, cpu);
+    if (naive) comparison.compare(gpu, naive->download_state(), naive->download_fields());
     for (int step = 0; step < 5; ++step) {
         cpu.step(); gpu.step();
+        if (naive) naive->step();
         comparison.compare(gpu, cpu); // Fields are still from pre-integration state.
+        if (naive) comparison.compare(gpu, naive->download_state(), naive->download_fields());
         cpu.evaluate_fields(); gpu.evaluate_fields();
+        if (naive) naive->evaluate_fields();
         comparison.compare(gpu, cpu); // Explicit current-state field evaluation.
+        if (naive) comparison.compare(gpu, naive->download_state(), naive->download_fields());
     }
 }
 
@@ -97,7 +107,7 @@ void asynchronous() {
     fluid::SimParams p;
     auto initial = fluid::make_dam_break(129, p);
     fluid::CpuSphSolver cpu(p, initial);
-    fluid::CudaSphSolver a(p, initial), b(p, initial);
+    fluid::CudaSphSolver a(p, initial, search), b(p, initial, search);
     // Independent streams, preallocated scratch, and odd A/B swap parity without readbacks.
     for (int step = 0; step < 5; ++step) { a.step(); cpu.step(); b.step(); }
     Comparison comparison;
@@ -110,37 +120,44 @@ void asynchronous() {
     b.step(); cpu.step(); a.synchronize(); b.synchronize();
     CHECK(std::isfinite(timing.total_ms) && timing.total_ms > 0);
     CHECK(timing.density_pressure_ms >= 0 && timing.forces_ms >= 0 && timing.integrate_ms >= 0);
-    near(timing.total_ms, timing.density_pressure_ms + timing.forces_ms + timing.integrate_ms, 0.005, 0.001);
+    CHECK(timing.grid_ms >= 0);
+    near(timing.total_ms, timing.grid_ms + timing.density_pressure_ms + timing.forces_ms + timing.integrate_ms, 0.005, 0.001);
     comparison.compare(a, cpu); comparison.compare(b, cpu);
 }
 
 void invalid() {
     fluid::SimParams p;
     const auto initial = fluid::make_dam_break(128, p);
-    throws<std::invalid_argument>([&] { fluid::CudaSphSolver gpu(p, {}); });
+    throws<std::invalid_argument>([&] { fluid::CudaSphSolver gpu(p, {}, search); });
     auto bad = initial; bad.velocities.pop_back();
-    throws<std::invalid_argument>([&] { fluid::CudaSphSolver gpu(p, bad); });
+    throws<std::invalid_argument>([&] { fluid::CudaSphSolver gpu(p, bad, search); });
     bad = initial; bad.positions[0].x = std::numeric_limits<float>::quiet_NaN();
-    throws<std::invalid_argument>([&] { fluid::CudaSphSolver gpu(p, bad); });
+    throws<std::invalid_argument>([&] { fluid::CudaSphSolver gpu(p, bad, search); });
     bad = initial; bad.positions[0].x = -1;
-    throws<std::invalid_argument>([&] { fluid::CudaSphSolver gpu(p, bad); });
-    bad.positions.resize(4097); bad.velocities.resize(4097);
-    throws<std::invalid_argument>([&] { fluid::CudaSphSolver gpu(p, bad); });
+    throws<std::invalid_argument>([&] { fluid::CudaSphSolver gpu(p, bad, search); });
+    const auto too_many = (search == fluid::CudaNeighborSearch::uniform_grid ? fluid::max_grid_particles : fluid::max_cpu_particles) + 1;
+    bad.positions.resize(too_many); bad.velocities.resize(too_many);
+    throws<std::invalid_argument>([&] { fluid::CudaSphSolver gpu(p, bad, search); });
     p.dt = 0;
-    throws<std::invalid_argument>([&] { fluid::CudaSphSolver gpu(p, initial); });
-    p = {}; p.spacing = 0.4f; p.smoothing_radius = 0.001f;
+    throws<std::invalid_argument>([&] { fluid::CudaSphSolver gpu(p, initial, search); });
+    p = {}; p.spacing = 0.4f;
+    p.smoothing_radius = search == fluid::CudaNeighborSearch::uniform_grid ? 0.01f : 0.001f;
     const fluid::ParticleState single{{{0.5f, 0.5f, 0.5f}}, {{}}};
-    throws<std::runtime_error>([&] { fluid::CudaSphSolver gpu(p, single); }); // EOS overflow, constructor cleanup.
+    throws<std::runtime_error>([&] { fluid::CudaSphSolver gpu(p, single, search); }); // EOS overflow, constructor cleanup.
     p = {}; p.dt = 2; p.gravity.y = -std::numeric_limits<float>::max();
-    fluid::CudaSphSolver gpu(p, single);
+    fluid::CudaSphSolver gpu(p, single, search);
     gpu.step();
     throws<std::runtime_error>([&] { gpu.synchronize(); }); // Async integration error is reported.
     throws<std::runtime_error>([&] { gpu.step(); });        // Poisoned solver cannot silently continue.
 }
 
-void stability() {
+void stability(std::size_t count = 512) {
     fluid::SimParams p;
-    fluid::CudaSphSolver gpu(p, fluid::make_dam_break(512, p));
+    if (count > 512) {
+        CHECK(search == fluid::CudaNeighborSearch::uniform_grid);
+        p.spacing = 0.0125f; p.smoothing_radius = 0.025f; p.boundary_padding = 0.00625f; p.dt = 0.0001f;
+    }
+    fluid::CudaSphSolver gpu(p, fluid::make_dam_break(count, p), search);
     float peak_density = 0, peak_speed = 0;
     for (int step = 0; step < 1000; ++step) {
         gpu.step();
@@ -157,7 +174,7 @@ void stability() {
     gpu.evaluate_fields(); gpu.synchronize();
     CHECK(peak_density > p.rest_density && peak_density < 2 * p.rest_density);
     CHECK(peak_speed < 20);
-    std::cout << "CUDA N=512 steps=1000 peak_density=" << peak_density << " peak_speed=" << peak_speed << '\n';
+    std::cout << "CUDA N=" << count << " steps=1000 dt=" << p.dt << " peak_density=" << peak_density << " peak_speed=" << peak_speed << '\n';
 }
 } // namespace
 
@@ -169,7 +186,8 @@ int main(int argc, char** argv) {
     }
     return run_test([&] {
         FLUID_CUDA_CHECK(status);
-        CHECK(argc == 2);
+        CHECK(argc == 2 || argc == 3);
+        if (argc == 3) { CHECK(std::string(argv[2]) == "grid"); search = fluid::CudaNeighborSearch::uniform_grid; }
         const std::string name = argv[1];
         if (name == "compare128") dam_break(128);
         else if (name == "compare256") dam_break(256);
@@ -178,6 +196,9 @@ int main(int argc, char** argv) {
         else if (name == "async") asynchronous();
         else if (name == "invalid") invalid();
         else if (name == "stability") stability();
+        else if (name == "scale10000") stability(10000);
+        else if (name == "scale25000") stability(25000);
+        else if (name == "scale50000") stability(50000);
         else if (name == "sanitizer") { dam_break(128); edges(); asynchronous(); invalid(); }
         else throw std::invalid_argument("unknown CUDA test case");
     });

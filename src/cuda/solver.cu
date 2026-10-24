@@ -2,17 +2,21 @@
 #include "fluid/initialization.h"
 #include "cuda_resources.cuh"
 #include "sph_pipeline.cuh"
+#include "spatial_grid.cuh"
 #include <stdexcept>
 #include <utility>
 #include <vector>
 
 namespace fluid {
 namespace {
-std::size_t validate(const SimParams& params, const ParticleState& state) {
+std::size_t validate(const SimParams& params, const ParticleState& state, CudaNeighborSearch search) {
     params.validate();
-    if (state.positions.empty() || state.positions.size() > max_cpu_particles ||
+    if (search != CudaNeighborSearch::all_pairs && search != CudaNeighborSearch::uniform_grid)
+        throw std::invalid_argument("unknown CUDA neighbor search");
+    const auto limit = search == CudaNeighborSearch::uniform_grid ? max_grid_particles : max_cpu_particles;
+    if (state.positions.empty() || state.positions.size() > limit ||
         state.velocities.size() != state.positions.size())
-        throw std::invalid_argument("CUDA all-pairs state needs matching arrays with 1-4096 particles");
+        throw std::invalid_argument("CUDA state needs matching arrays with 1-" + std::to_string(limit) + " particles");
     for (std::size_t i = 0; i < state.positions.size(); ++i) {
         if (!inside_bounds(state.positions[i], params) || !is_finite(state.velocities[i]))
             throw std::invalid_argument("invalid CUDA initial state at particle " + std::to_string(i));
@@ -35,6 +39,7 @@ std::vector<Vec3> unpack_host(const std::vector<float4>& input) {
 
 struct CudaSphSolver::Impl {
     SimParams params;
+    CudaNeighborSearch search;
     std::size_t count;
     SphKernels kernels;
     cuda_detail::DeviceParams device_params;
@@ -42,17 +47,19 @@ struct CudaSphSolver::Impl {
     cuda_detail::DeviceBuffer<float> densities, pressures;
     cuda_detail::DeviceBuffer<int> status;
     cuda_detail::PinnedStatus host_status;
-    cuda_detail::Event start, after_density, after_forces, finish;
+    std::unique_ptr<cuda_detail::SpatialGrid> grid;
+    cuda_detail::Event start, after_grid, after_density, after_forces, finish;
     // Last owned CUDA resource: drained first, even if construction fails partway.
     cuda_detail::Stream stream;
     float4 *positions, *next_positions, *velocities, *next_velocities;
     int device = 0;
     bool failed = false;
 
-    Impl(SimParams p, const ParticleState& initial)
-        : params(p), count(validate(p, initial)), kernels(p.smoothing_radius), device_params(cuda_detail::device_params(p)),
+    Impl(SimParams p, const ParticleState& initial, CudaNeighborSearch mode)
+        : params(p), search(mode), count(validate(p, initial, mode)), kernels(p.smoothing_radius), device_params(cuda_detail::device_params(p)),
           positions_a(count), positions_b(count), velocities_a(count), velocities_b(count), accelerations(count),
           densities(count), pressures(count), status(1),
+          grid(mode == CudaNeighborSearch::uniform_grid ? std::make_unique<cuda_detail::SpatialGrid>(p, static_cast<int>(count)) : nullptr),
           positions(positions_a.data), next_positions(positions_b.data),
           velocities(velocities_a.data), next_velocities(velocities_b.data) {
         FLUID_CUDA_CHECK(cudaGetDevice(&device));
@@ -73,10 +80,14 @@ struct CudaSphSolver::Impl {
         if (active != device) throw std::runtime_error("CUDA solver must be used with its construction device current");
     }
     void density() {
-        cuda_detail::launch_density(positions, densities.data, pressures.data, static_cast<int>(count), device_params, kernels, status.data, stream.value);
+        if (grid) cuda_detail::launch_grid_density(positions, densities.data, pressures.data, static_cast<int>(count),
+                                                   device_params, kernels, status.data, grid->view(), stream.value);
+        else cuda_detail::launch_density(positions, densities.data, pressures.data, static_cast<int>(count), device_params, kernels, status.data, stream.value);
     }
     void force() {
-        cuda_detail::launch_forces(positions, velocities, densities.data, pressures.data, accelerations.data,
+        if (grid) cuda_detail::launch_grid_forces(positions, velocities, densities.data, pressures.data, accelerations.data,
+                                                 static_cast<int>(count), device_params, kernels, status.data, grid->view(), stream.value);
+        else cuda_detail::launch_forces(positions, velocities, densities.data, pressures.data, accelerations.data,
                                   static_cast<int>(count), device_params, kernels, status.data, stream.value);
     }
     void integrate() {
@@ -97,21 +108,27 @@ struct CudaSphSolver::Impl {
                 case cuda_detail::pressure_error: stage = "pressure"; break;
                 case cuda_detail::force_error: stage = "force"; break;
                 case cuda_detail::integration_error: stage = "integration"; break;
+                case cuda_detail::grid_error: stage = "grid indexing"; break;
             }
             throw std::runtime_error(std::string("CUDA numerical failure in ") + stage + "; discard this solver and check parameters/dt");
         }
     }
 };
 
-CudaSphSolver::CudaSphSolver(SimParams params, const ParticleState& initial)
-    : impl_(std::make_unique<Impl>(params, initial)) {
+CudaSphSolver::CudaSphSolver(SimParams params, const ParticleState& initial, CudaNeighborSearch search)
+    : impl_(std::make_unique<Impl>(params, initial, search)) {
     evaluate_fields();
     synchronize();
 }
 CudaSphSolver::~CudaSphSolver() = default;
 std::size_t CudaSphSolver::particle_count() const { return impl_->count; }
 const SimParams& CudaSphSolver::params() const { return impl_->params; }
-void CudaSphSolver::evaluate_fields() { impl_->check(); impl_->density(); impl_->force(); }
+CudaNeighborSearch CudaSphSolver::neighbor_search() const { return impl_->search; }
+void CudaSphSolver::evaluate_fields() {
+    impl_->check();
+    if (impl_->grid) impl_->grid->build(impl_->positions, impl_->status.data, impl_->stream.value);
+    impl_->density(); impl_->force();
+}
 void CudaSphSolver::step() { evaluate_fields(); impl_->integrate(); }
 void CudaSphSolver::synchronize() { impl_->sync(); }
 
@@ -119,6 +136,10 @@ CudaStepTimings CudaSphSolver::step_timed() {
     auto& s = *impl_;
     s.check();
     FLUID_CUDA_CHECK(cudaEventRecord(s.start.value, s.stream.value));
+    if (s.grid) {
+        s.grid->build(s.positions, s.status.data, s.stream.value);
+        FLUID_CUDA_CHECK(cudaEventRecord(s.after_grid.value, s.stream.value));
+    }
     s.density();
     FLUID_CUDA_CHECK(cudaEventRecord(s.after_density.value, s.stream.value));
     s.force();
@@ -127,7 +148,8 @@ CudaStepTimings CudaSphSolver::step_timed() {
     FLUID_CUDA_CHECK(cudaEventRecord(s.finish.value, s.stream.value));
     FLUID_CUDA_CHECK(cudaEventSynchronize(s.finish.value));
     CudaStepTimings timings;
-    FLUID_CUDA_CHECK(cudaEventElapsedTime(&timings.density_pressure_ms, s.start.value, s.after_density.value));
+    if (s.grid) FLUID_CUDA_CHECK(cudaEventElapsedTime(&timings.grid_ms, s.start.value, s.after_grid.value));
+    FLUID_CUDA_CHECK(cudaEventElapsedTime(&timings.density_pressure_ms, s.grid ? s.after_grid.value : s.start.value, s.after_density.value));
     FLUID_CUDA_CHECK(cudaEventElapsedTime(&timings.forces_ms, s.after_density.value, s.after_forces.value));
     FLUID_CUDA_CHECK(cudaEventElapsedTime(&timings.integrate_ms, s.after_forces.value, s.finish.value));
     FLUID_CUDA_CHECK(cudaEventElapsedTime(&timings.total_ms, s.start.value, s.finish.value));

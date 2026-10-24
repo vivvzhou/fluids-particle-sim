@@ -220,7 +220,10 @@ void invalid() {
     throws<std::invalid_argument>([&] { p.validate(); });
     p = {};
     throws<std::invalid_argument>([&] { fluid::make_dam_break(0, p); });
-    throws<std::invalid_argument>([&] { fluid::make_dam_break(4097, p); });
+    throws<std::invalid_argument>([&] { fluid::make_dam_break(fluid::max_grid_particles + 1, p); });
+    auto large_params = p; large_params.spacing = 0.01f;
+    const auto large = fluid::make_dam_break(4097, large_params);
+    throws<std::invalid_argument>([&] { fluid::CpuSphSolver solver(large_params, large); });
     throws<std::invalid_argument>([&] { fluid::make_dam_break(128, p, 42, nan); });
     p.spacing = 1;
     throws<std::invalid_argument>([&] { fluid::make_dam_break(128, p); });

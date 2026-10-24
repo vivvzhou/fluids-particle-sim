@@ -6,8 +6,8 @@
 namespace fluid {
 ParticleState make_dam_break(std::size_t count, const SimParams& params, std::uint32_t seed, float jitter) {
     params.validate();
-    if (count == 0 || count > max_cpu_particles)
-        throw std::invalid_argument("CPU particle count must be in [1, 4096]; recommend 128-512");
+    if (count == 0 || count > max_grid_particles)
+        throw std::invalid_argument("dam-break initialization requires 1-50000 particles; solver-specific limits also apply");
     if (!std::isfinite(jitter) || jitter < 0.0f || jitter > 0.1f)
         throw std::invalid_argument("jitter must be a finite spacing fraction in [0, 0.1]");
 

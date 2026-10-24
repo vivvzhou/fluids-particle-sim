@@ -1,13 +1,16 @@
 # 3D WCSPH fluid simulation
 
-Implemented through **M2** of `CUDA_Fluid_Simulation_Project_Spec.md`: a C++17 CPU reference
-and a naive CUDA all-pairs solver for a seeded 3D dam break. Both support density, Tait
+Implemented through **M3** of `docs/CUDA_Fluid_Simulation_Project_Spec.md`: a C++17 CPU reference,
+a naive CUDA all-pairs reference and a CUDA uniform-grid solver for a seeded 3D dam break.
+All support density, Tait
 pressure, viscosity, gravity, semi-implicit Euler integration, box collisions and binary
 PLY export. CMake/CTest builds require no third-party test framework.
 
-M3 and later milestones are not implemented. There is no grid search, CUB sorting, GUI,
-Vulkan interop or ML dependency. CUDA is optional; the CPU reference remains usable alone.
-The original specification was read during M0/M1 but is not present in the current checkout.
+M3 adds cell keys, CUB radix sorting and 27-cell neighbor traversal. CUB comes with the
+CUDA Toolkit; no separate installation is needed. M4 and later milestones are not
+implemented. There is no GUI, Vulkan interop or ML dependency. CUDA is optional; the
+CPU reference remains usable alone. Local specification and detailed reports live in
+`docs/`, which this checkout currently ignores in Git.
 
 ## Windows build
 
@@ -77,17 +80,20 @@ used Windows/MSVC.
 
 ```powershell
 .\build-cuda\Release\fluid_sim.exe --help
-.\build-cuda\Release\fluid_sim.exe --backend cuda --particles 512 --steps 1000 --dt 0.0005 --seed 42 --dump-every 250 --output results/m2/dam_break
+.\build-cuda\Release\fluid_sim.exe --backend cuda --neighbor-search grid --particles 25000 --spacing 0.0125 --dt 0.0001 --steps 1000 --seed 42 --dump-every 250 --output results/m3/dam_break
+.\build-cuda\Release\fluid_sim.exe --backend cuda --neighbor-search all-pairs --particles 512 --steps 1000
 .\build-cpu\Release\fluid_sim.exe --backend cpu --particles 256 --steps 1000 --dump-every 50 --output results/cpu_dam_break
 ```
 
-The CUDA example was run successfully and writes five frames from `frame_000000.ply`
-through `frame_001000.ply`. Export includes the initial state, requested intervals and
+The grid example writes five frames from `frame_000000.ply` through `frame_001000.ply`.
+Export includes the initial state, requested intervals and
 the final state even when the interval does not divide the step count. PLY files contain
 vertex-only xyz float32 values in binary little-endian PLY 1.0. Output directories are
 created; matching filenames are overwritten, so use a fresh directory for each run.
 
-No arguments selects CPU, 256 particles, 1000 steps and no exports. `--dump-every 0`
+No arguments selects CPU, 256 particles, 1000 steps and no exports. With `--backend cuda`,
+neighbor search defaults to `grid`; select `all-pairs` explicitly for the M2 baseline.
+`--neighbor-search` is rejected for the CPU backend. `--dump-every 0`
 creates no files; `--steps 0 --dump-every 1` exports the initial state. The CLI prints
 resolved parameters and final density/speed diagnostics. Its wall time includes exports,
 readback and final field evaluation; use the separate stage timing executable below
@@ -111,11 +117,69 @@ Exit codes: 0 success, 1 invalid input/simulation/I/O failure, 2 unavailable dev
 to half spacing; explicit `--h` and `--padding` override these defaults. Parameters are
 validated before allocation. The lattice must fit the padded box.
 
-Both solvers are O(N^2), capped at **4096 particles**. CPU correctness workloads use
-128-512 particles. Larger M2 runs use smaller spacing and dt, as in the timing preset.
+CPU and naive CUDA are O(N^2), capped at **4096 particles**. The M3 grid path permits
+**50000 particles**; use the tested spacing/dt below so the larger lattice fits the box.
+The initializer permits 50K, while each solver independently enforces its own cap.
+Dense cell tables are limited to 4,194,304 cells (32 MiB for both range arrays); a smaller
+h or larger box that exceeds this limit is rejected before allocating grid buffers.
+CPU correctness workloads use 128-512 particles.
 This is a compressible reference model, without boundary particles, density correction,
 adaptive timesteps or an incompressibility solve. Custom parameters can be unstable.
-The [M2 report](M2_VALIDATION.md) describes equations, error handling and numerical limits.
+The [M2 report](docs/M2_VALIDATION.md) describes equations, error handling and numerical limits.
+
+## M3 grid pipeline and scale checks
+
+Each step computes collision-free keys `cx + nx * (cy + ny * cz)` for cells of width h,
+sorts `(cell key, original particle ID)` with `cub::DeviceRadixSort::SortPairs`, clears
+start/end tables to -1, and builds half-open ranges. Density and force kernels inspect
+the 27 neighboring cells and filter by distance `< h`. They access the original arrays
+through sorted IDs; physical state is not reordered. Boundary coordinates are clamped
+to valid cells, including closed upper box faces. Empty/outside cells are skipped.
+
+All operations use the solver's stream. CUB scratch and grid buffers are allocated once
+during construction. Indexing is rebuilt before every field evaluation, so a new state
+cannot use stale cell ranges. Integration retains separate input/output buffers and
+swaps only after launch. Grid construction costs O(N) for fixed-width radix sorting plus
+O(number of cells) for range clearing; traversal costs the number of nearby candidates.
+Dense clustering can still produce O(N^2) work.
+
+The API keeps its backward-compatible all-pairs default; opt into the grid explicitly:
+
+```cpp
+fluid::CudaSphSolver solver(params, initial, fluid::CudaNeighborSearch::uniform_grid);
+solver.step();
+solver.synchronize(); // Reports asynchronous runtime and numerical errors.
+auto state = solver.download_state(); // Host copy outside the hot path.
+```
+
+The fields after `step()` describe its input state. Call `evaluate_fields()` to evaluate
+the updated positions/velocities. Keep the construction CUDA device current throughout
+the solver lifetime; one instance is not thread-safe. An observed numerical failure
+invalidates the solver, and destructors cannot report errors: synchronize explicitly.
+
+Reproduce the M3 acceptance runs (seed 42, jitter 0.02, no exports):
+
+```powershell
+foreach ($n in @(10000, 25000, 50000)) {
+    .\build-cuda\Release\fluid_sim.exe --backend cuda --neighbor-search grid --particles $n --spacing 0.0125 --dt 0.0001 --steps 1000
+}
+ctest --test-dir build-cuda -C Release -L grid --output-on-failure
+```
+
+The scale tests inspect every step, including finite acceleration/velocity/positions,
+positive density, nonnegative pressure and padded bounds. The tested preset has
+h=0.025, mass=0.001953125, padding=0.00625, rho0=1000, B=100000, nu=0.01,
+gravity `(0,-9.81,0)`, restitution 0.3 and 1000 fixed steps of dt=0.0001 (0.1 seconds).
+
+| Particles | Peak sampled density | Peak speed | Result |
+|---:|---:|---:|---|
+| 10000 | 1031.67 | 1.16785 | 1000 steps passed |
+| 25000 | 1033.99 | 1.30554 | 1000 steps passed |
+| 50000 | 1038.30 | 1.37093 | 1000 steps passed |
+
+These are stability checks for this preset, not controlled timing results or a guarantee
+for custom parameters. The 100K preset, extended stress/tuning and a full indexed
+benchmark command belong to M4. The M2 timing harness below continues to use all-pairs.
 
 ## M2 stage timings
 
@@ -137,26 +201,35 @@ The output filenames are overwritten on repeated runs in the same directory.
 On the verified GPU, medians of three run medians were **0.231 ms / 0.422 ms / 0.770 ms**
 for 1024 / 2048 / 4096 particles. These are instrumented CUDA-event stage spans, including
 possible submission gaps; they are not rendering FPS or isolated profiler kernel times.
-The [report](M2_VALIDATION.md#timing-results) includes all runs and measurement limitations.
+The [report](docs/M2_VALIDATION.md#timing-results) includes all runs and measurement limitations.
 
 ## Validation and architecture
 
-CUDA Release passed **26/26** CTest cases, CUDA Debug **25/25**, and CPU-only Release
-**16/16**. Debug excludes the timing harness contract. CPU/GPU comparisons cover
-128/256/512 particles, three seeds, initial fields and each of five steps, with documented
-FP32 tolerances. Edge fixtures, independent streams, asynchronous errors, PLY output
-and 1000-step stability are also checked. Compute Sanitizer memcheck, racecheck,
-initcheck and synccheck all passed on the dedicated small-case suite.
+CUDA Release passed **40/40** CTest cases, CUDA Debug **39/39**, and CPU-only Release
+**16/16**. Debug excludes the timing harness contract. All four Compute Sanitizer tools
+passed the neighbor suite, grid physics suite and a 10K smoke run: no errors or leaks,
+and no shared-memory race hazards. Tests compare
+grid, naive CUDA and CPU for 128/256/512 particles, three seeds, initial fields and each
+of five steps. Component tolerances are `abs(gpu-reference) <= atol + 1e-4*abs(reference)`,
+with atol=1e-5 position, 1e-4 velocity, 1e-2 density, 1 pressure and 1e-2 acceleration.
+No M2 tolerances were loosened. Edge fixtures, independent streams, asynchronous errors,
+PLY output and 1000-step stability are also checked.
+
+Grid tests compare exact neighbor masks with brute force, detecting missing and duplicate
+visits. They verify sorted keys/IDs and every occupied/empty range on randomized scenes,
+overlaps, cell-edge/box-face points, shifted domains, partial end cells, one-cell grids
+and particles moving out of occupied cells. FP32 summation order changes with traversal;
+short-step agreement does not imply matching long trajectories.
 
 | Module | Responsibility |
 |---|---|
 | `fluid_core` | Parameters, seeded host initialization, CPU reference, shared math |
-| `fluid_cuda` | Private device buffers/stream/events and three all-pairs CUDA stages |
+| `fluid_cuda` | Buffers/stream/events, grid indexing/CUB sorting and shared CUDA physics |
 | `fluid_io` | Renderer-independent binary PLY export |
 | `fluid_device` | CUDA device diagnostics or CPU-only fallback |
 | `fluid_sim` | Backend selection, fixed-step loop, export and diagnostics |
 | `fluid_cuda_benchmark` | M2 stage timing and CSV output |
-| `tests/` | Analytic CPU checks, CUDA comparisons, stability and CLI contracts |
+| `tests/` | CPU physics, exact grid neighbors, backend comparisons, stability and CLI contracts |
 
 The CUDA public API hides CUDA types. Positions and velocities use separate preallocated
 A/B `float4` buffers; density, pressure and acceleration have their own arrays. No device
@@ -164,5 +237,6 @@ allocation, export or readback occurs in ordinary `step()`. Each solver owns one
 Shared SPH and collision math keeps both backends consistent. Explicit downloads provide
 the future renderer boundary without coupling physics to graphics resources.
 
-See [M2 validation and M3 handoff](M2_VALIDATION.md) for sanitizer commands, ownership
-contracts and next steps. **Implementation stops after M2.**
+See [M3 validation and M4 handoff](docs/M3_VALIDATION.md) for detailed results and sanitizer
+commands. **Implementation stops after M3.** M4 should add a validated 100K preset,
+longer stress cases and reproducible stage benchmarks with identical small-N comparisons.
